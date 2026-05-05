@@ -1,0 +1,12 @@
+# Ignore raw and processed data
+raw_data/
+processed_data/
+
+# Ignore system and heavy files
+*.csv
+*.xlsx
+*.parquet
+*.mat
+__pycache__/
+.DS_Store
+test.ipynb
