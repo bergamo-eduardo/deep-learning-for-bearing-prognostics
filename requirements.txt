@@ -1,8 +1,14 @@
-#1. Data preprocessing
-polars==1.40.0
-numpy>=1.24.0
-scipy==1.17.0
+# Manipulação de Dados de Alta Performance
+polars>=0.20.0
 pandas>=2.0.0
-matplotlib>=3.7.0
+numpy>=1.24.0
 
-#2. Deep-Learning model
+# Processamento Digital de Sinais e Matemática
+scipy>=1.10.0
+
+# Motor de Armazenamento (Obrigatório para Parquet)
+pyarrow>=14.0.0
+
+# Visualização e Validação de Sinais
+matplotlib>=3.7.0
+seaborn>=0.12.0
