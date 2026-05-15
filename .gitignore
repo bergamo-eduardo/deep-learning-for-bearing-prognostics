@@ -1,12 +1,36 @@
-# Ignore raw and processed data
-raw_data/
-processed_data/
+# --- 1. Dados Experimentais ---
+data/raw_data/
+data/processed_data/
+data/tmp_parquet_chunks/
 
-# Ignore system and heavy files
-*.csv
-*.xlsx
-*.parquet
-*.mat
+# --- 2. Referências e Documentação Externa ---
+references/
+
+# --- 3. Resultados do Modelo (Pesos e Checkpoints) ---
+# Modelos treinados (.h5, .keras, .pth) são muito grandes para o Git
+results/*.h5
+results/*.keras
+results/*.pth
+results/*.pt
+
+# --- 4. Logs e Arquivos de Sistema ---
+# Ignora logs de experimentos e do próprio Python
+*.log
+**/B*_log.pdf
 __pycache__/
 .DS_Store
+Thumbs.db
+
+# --- 5. Ambiente de Desenvolvimento e Notebooks ---
+.venv/
+env/
+venv/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# --- 6. Exceções (manter vazias) ---
+!**/data/**/.gitkeep
+!**/results/**/.gitkeep
+!**/references/**/.gitkeep
 test.ipynb
