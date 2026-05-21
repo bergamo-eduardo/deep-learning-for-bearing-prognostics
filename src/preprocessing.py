@@ -160,12 +160,24 @@ def processar_experimento(exp: str):
     print(f"Processamento concluído com êxito! Arquivo final gerado: {output_file}")
 
 if __name__ == '__main__':
-    # 1. Para processar um único experimento selecionado:
-    experimento_alvo = 'B01'  # Altere aqui para 'B02', 'B03', etc.
-    processar_experimento(experimento_alvo)
-    
-    # 2. (OPCIONAL) Para processamento em lote (Batch) de vários experimentos no futuro, 
-    # comente as duas linhas acima e descomente as linhas abaixo:
-    # lista_de_experimentos = ['B01', 'B02', 'B03', 'B04']
-    # for exp_atual in lista_de_experimentos:
-    #     processar_experimento(exp_atual)
+    exp_batch = [
+        'B01',
+        'B02',
+        'B03',
+        'B04',
+        'B05',
+        'B06',
+        'B07',
+        'B08',
+        'B09',
+        'B10',
+        'B11',
+        'B12',
+        'B13',
+        'B14',
+        'B15',
+        'B16',
+        'B17'
+        ]
+    for exp_atual in exp_batch:
+        processar_experimento(exp_atual)
