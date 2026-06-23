@@ -1,17 +1,12 @@
-# --- 1. Dados Experimentais ---
-data/raw_data/
-data/processed_data/
-data/tmp_parquet_chunks/
+# --- 1. Dados experimentais usados para treinamento, teste e validação ---
+data/processed_data/**
+data/raw_data/**
 
-# --- 2. Referências e Documentação Externa ---
-references/
 
 # --- 3. Resultados do Modelo (Pesos e Checkpoints) ---
-# Modelos treinados (.h5, .keras, .pth) são muito grandes para o Git
-results/*.h5
-results/*.keras
-results/*.pth
-results/*.pt
+# Ignora todos os arquivos gerados em results, mas mantém a pasta vazia por meio de .gitkeep
+results/**
+!results/.gitkeep
 
 # --- 4. Logs e Arquivos de Sistema ---
 # Ignora logs de experimentos e do próprio Python
@@ -30,7 +25,5 @@ venv/
 .idea/
 
 # --- 6. Exceções (manter vazias) ---
-!**/data/**/.gitkeep
-!**/results/**/.gitkeep
-!**/references/**/.gitkeep
-test.ipynb
+!**/data/processed_data/.gitkeep
+!**/data/raw_data/.gitkeep
