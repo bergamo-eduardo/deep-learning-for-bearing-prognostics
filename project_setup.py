@@ -18,13 +18,12 @@ def inicializar_estrutura():
     diretorios = [
         raiz / "data" / "raw_data",          # Dados imutáveis (.mat)
         raiz / "data" / "processed_data",    # Datasets consolidados (.parquet)
-        raiz / "data" / "tmp_parquet_chunks", # Diretório transiente para processamento
         raiz / "notebooks",                  # Pesquisa exploratória (EDA)
         raiz / "results",    # Garantir que a pasta de resultados exista
         raiz / "src"                         # Scripts de processamento e modelagem
     ]
 
-    print("Iniciando a criação da estrutura de diretórios acadêmicos...")
+    print("Criando diretórios...")
 
     for caminho in diretorios:
         try:
