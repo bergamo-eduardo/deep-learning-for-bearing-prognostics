@@ -27,5 +27,4 @@ venv/
 # --- 6. Exceções (manter vazias) ---
 !**/data/processed_data/.gitkeep
 !**/data/raw_data/.gitkeep
-
 diagrams/

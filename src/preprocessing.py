@@ -10,6 +10,7 @@ Orientador: Prof. Dr. Pedro Fernando Poveda
 import gc
 import glob
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -21,12 +22,21 @@ import polars as pl
 import scipy.io as sio
 import scipy.signal as sig
 
+# Dicionário de transição (fase saudável -> falha) baseado na documentação
+# Os valores indicam o índice MXXXX a partir do qual a degradação se inicia.
+TRANSITION_TIMES = {
+    "B01": 208, "B02": 998, "B03": 562, "B04": 452, "B05": 560,
+    "B06": 12853, "B07": 6205, "B08": 1219, "B09": 253, "B10": 2679,
+    "B11": 931, "B12": 154, "B13": 18022, "B14": 12050, "B15": 21051,
+    "B16": 5400, "B17": 2323
+}
 
 def preprocess_to_parquet_eda(exp: str) -> None:
     """
     Processa os sinais brutos e os converte em um conjunto de dados tabular único
     em formato Parquet para Análise Exploratória de Dados (EDA).
-    Aplica decimação em cascata para atingir uma taxa de amostragem efetiva de 4 kHz.
+    Aplica decimação em cascata para atingir uma taxa de amostragem efetiva de 4 kHz,
+    desconsiderando os dados referentes à fase saudável (antes do transition time).
     """
     print(f"\n[EDA PIPELINE] Construindo dataset analítico do experimento {exp} (4 kHz)...")
     
@@ -53,6 +63,7 @@ def preprocess_to_parquet_eda(exp: str) -> None:
     FATOR_CONVERSAO_G = 10.0
     exp_number = int(exp.replace('B', ''))
     is_128kHz = exp_number <= 9
+    transition_idx = TRANSITION_TIMES.get(exp, 0)
 
     # 2. Sincronização Relacional (As-Of Join)
     df_oc = pd.read_csv(oc_data)
@@ -85,6 +96,13 @@ def preprocess_to_parquet_eda(exp: str) -> None:
 
     # 4. Processamento Digital em Lotes (Out-of-Core)
     for i, file_path in enumerate(matlab_files):
+        # Extração e validação do índice MXXXX para descarte da fase saudável
+        match = re.search(r'M(\d+)', file_path.stem)
+        file_idx = int(match.group(1)) if match else (i + 1)
+        
+        if file_idx < transition_idx:
+            continue
+            
         mat_data = sio.loadmat(file_path)
         
         acc_a = mat_data['accHorizRear_A'].flatten() * FATOR_CONVERSAO_G
@@ -137,17 +155,23 @@ def preprocess_to_parquet_eda(exp: str) -> None:
 
     # 5. Consolidação Unificada
     output_file = base_processed / f"eda_{exp}_4kHz.parquet"
-    lazy_dataset = pl.scan_parquet(temp_dir / "*.parquet")
-    lazy_dataset.sink_parquet(output_file)
-
-    shutil.rmtree(temp_dir)
-    print(f"[SUCESSO] Dataset analítico (EDA) consolidado e armazenado em: {output_file}")
+    # Adicionado try/except para previnir erro caso o experimento estivesse inteiramente limpo antes do tempo de transição
+    try:
+        lazy_dataset = pl.scan_parquet(temp_dir / "*.parquet")
+        lazy_dataset.sink_parquet(output_file)
+        print(f"[SUCESSO] Dataset analítico (EDA) consolidado e armazenado em: {output_file}")
+    except Exception as e:
+        print(f"[AVISO] Nenhum dado gerado para {exp} após o filtro de transição. Detalhes: {e}")
+        
+    shutil.rmtree(temp_dir, ignore_errors=True)
 
 def preprocess_to_npz(exp: str, window_size: int, seq_length: int, f_amostragem_kHz: int) -> None:
     """
     Realiza o pré-processamento dos dados brutos experimentais, aplicando sincronização
     relacional, decimação dinâmica e estruturação em tensores quadridimensionais
     para o treinamento sequencial. Alvo de amostragem estabelecido em 32 kHz.
+    
+    A filtragem temporal descarta arquivos correspondentes à fase saudável do componente.
     
     Parâmetros:
     -----------
@@ -157,6 +181,8 @@ def preprocess_to_npz(exp: str, window_size: int, seq_length: int, f_amostragem_
         Número de amostras pontuais (discretas) que compõem cada janela.
     seq_length : int
         Número de janelas concatenadas para formar a trajetória de degradação.
+    f_amostragem_kHz : int
+        Frequência alvo para a taxa de amostragem após a decimação digital.
     """
     print(f"\n[TENSOR PIPELINE] Iniciando conversão matricial sequencial do experimento {exp} ({f_amostragem_kHz} kHz)...")
     
@@ -182,6 +208,7 @@ def preprocess_to_npz(exp: str, window_size: int, seq_length: int, f_amostragem_
     FATOR_CONVERSAO_G = 10.0
     exp_number = int(exp.replace('B', ''))
     is_128kHz = exp_number <= 9
+    transition_idx = TRANSITION_TIMES.get(exp, 0)
 
     if not (oc_data.exists() and temp_data.exists()):
         print(f"[ERRO] Arquivos de variáveis operacionais (CSV) ausentes em: {base_original}")
@@ -218,6 +245,13 @@ def preprocess_to_npz(exp: str, window_size: int, seq_length: int, f_amostragem_
     total_sequences_generated = 0
     
     for i, file_path in enumerate(matlab_files):
+        # Exclusão da amostragem anterior ao período de degradação
+        match = re.search(r'M(\d+)', file_path.stem)
+        file_idx = int(match.group(1)) if match else (i + 1)
+        
+        if file_idx < transition_idx:
+            continue
+            
         mat_data = sio.loadmat(file_path)
         
         acc_a = mat_data['accHorizRear_A'].flatten() * FATOR_CONVERSAO_G
@@ -225,7 +259,7 @@ def preprocess_to_npz(exp: str, window_size: int, seq_length: int, f_amostragem_
         meas_time = mat_data['measTime'].flatten()
 
         # Determinação do fator de subamostragem baseado na frequência original
-        # Assegurando taxa final idêntica (32 kHz) para todos os ensaios
+        # Assegurando taxa final idêntica (ex. 32 kHz) para todos os ensaios
         fator_q = 128//f_amostragem_kHz if is_128kHz else 64//f_amostragem_kHz
 
         # Aplicação de decimação e filtro FIR anti-aliasing
@@ -335,26 +369,12 @@ def calcular_estatisticas_treino(processed_dir: Path, target_dir: Path, bearings
 
 if __name__ == '__main__':
     # Ensaios selecionados
-    exp_batch = [
-        "B02",
-        "B03",
-        "B04",
-        "B07",
-        "B08",
-        "B09",
-        "B10",
-        "B11",
-        "B12",
-        "B14",
-        "B17"
-    ]
+    exp_batch = ['B06', 'B13', 'B15']
     
-
-    
-    # Executar apenas se houver necessidade de nova exploração no notebook Pandas
-    for experimento in exp_batch:
-        preprocess_to_parquet_eda(experimento)
+    # # Criação de arquivos Parquet para EDA
+    #for experimento in exp_batch:
+    #     preprocess_to_parquet_eda(experimento)
         
-    # # Construção rigorosa de matrizes sequenciais para alimentação computacional
-    # for experimento in exp_batch:
-    #     preprocess_to_npz(experimento, window_size=4096, seq_length=10, f_amostragem_kHz=32)
+    # Criação de sequências de tensores
+    for experimento in exp_batch:
+        preprocess_to_npz(experimento, window_size=4096, seq_length=10, f_amostragem_kHz=32)
