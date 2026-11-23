@@ -24,7 +24,9 @@ venv/
 .vscode/
 .idea/
 
-# --- 6. Exceções (manter vazias) ---
+# --- 6. Exceções ---
 !**/data/processed_data/.gitkeep
 !**/data/raw_data/.gitkeep
 diagrams/
+src/train_single_exp.py
+src/recover_loro_summary.py
