@@ -1,14 +1,9 @@
-"""
-Módulo Unificado de Integração de Metadados e Pré-processamento
-Trabalho de Conclusão de Curso - Estimativa de RUL via Deep Learning
-Foco: Tensores 4D para CNN-LSTM (LORO) e Extração Parquet (4kHz) para EDA
+"""Pre-processing for experimental data for Deep Learning pipeline and EDA."""
 
-Autor: Eduardo Kanadani Bergamo
-Orientador: Prof. Dr. Pedro Fernando Poveda
-"""
+from __future__ import annotations
 
+import argparse
 import gc
-import glob
 import json
 import re
 import shutil
@@ -22,359 +17,423 @@ import polars as pl
 import scipy.io as sio
 import scipy.signal as sig
 
-# Dicionário de transição (fase saudável -> falha) baseado na documentação
-# Os valores indicam o índice MXXXX a partir do qual a degradação se inicia.
+
+OP_FEATURE_COLS = [
+    "meanAbs_speed / rpm",
+    "meanAbs_statLoad / N",
+    "peak_dynLoad / N",
+]
+
 TRANSITION_TIMES = {
-    "B01": 208, "B02": 998, "B03": 562, "B04": 452, "B05": 560,
-    "B06": 12853, "B07": 6205, "B08": 1219, "B09": 253, "B10": 2679,
-    "B11": 931, "B12": 154, "B13": 18022, "B14": 12050, "B15": 21051,
-    "B16": 5400, "B17": 2323
+    "B01": 208, "B02": 998, "B03": 562, "B04": 452,
+    "B05": 560, "B06": 12853, "B07": 6205, "B08": 1219,
+    "B09": 253, "B10": 2679, "B11": 931, "B12": 154,
+    "B13": 18022, "B14": 12050, "B15": 21051, "B16": 5400,
+    "B17": 2323,
 }
 
-def preprocess_to_parquet_eda(exp: str) -> None:
-    """
-    Processa os sinais brutos e os converte em um conjunto de dados tabular único
-    em formato Parquet para Análise Exploratória de Dados (EDA).
-    Aplica decimação em cascata para atingir uma taxa de amostragem efetiva de 4 kHz,
-    desconsiderando os dados referentes à fase saudável (antes do transition time).
-    """
-    print(f"\n[EDA PIPELINE] Construindo dataset analítico do experimento {exp} (4 kHz)...")
-    
-    # 1. Resolução de Diretórios
+CLEAN14 = [
+    "B02", "B03", "B04", "B06", "B07", "B08", "B09", "B10",
+    "B11", "B12", "B13", "B14", "B15", "B17",
+]
+BENCHMARK17 = [f"B{i:02d}" for i in range(1, 18)]
+TENSOR_FORMAT_ERROR = "Formato do tensor não match formato de entrada"
+
+
+def _resolve_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    """Resolve one of the candidate column names in a metadata frame."""
+    for candidate in candidates:
+        if candidate in df.columns:
+            return candidate
+    raise ValueError(
+        f"Nenhuma coluna temporal encontrada. Esperada uma de {candidates}; "
+        f"colunas disponíveis: {list(df.columns)}"
+    )
+
+
+def _numeric_mat_sort_key(path: Path) -> int:
+    match = re.search(r"M(\d+)", path.stem)
+    if match is None:
+        raise ValueError(f"Nome de arquivo .mat sem índice MXXXX: {path.name}")
+    return int(match.group(1))
+
+
+def _chunk_index(path: Path) -> int:
+    match = re.search(r"(\d+)", path.stem)
+    if match is None:
+        raise ValueError(f"Nome de chunk sem índice numérico: {path.name}")
+    return int(match.group(1))
+
+
+def _validate_op_features(df: pd.DataFrame, source_name: str) -> None:
+    missing = [column for column in OP_FEATURE_COLS if column not in df.columns]
+    if missing:
+        raise ValueError(f"{source_name}: colunas operacionais ausentes: {missing}")
+    values = df.loc[:, OP_FEATURE_COLS].to_numpy(dtype=np.float64)
+    if not np.isfinite(values).all():
+        bad = df.loc[:, OP_FEATURE_COLS].isna().sum().to_dict()
+        raise ValueError(
+            f"{source_name}: valores ausentes ou não finitos nas 3 variáveis operacionais: {bad}"
+        )
+
+
+def _project_root() -> Path:
     try:
-        projeto_root = Path(__file__).resolve().parents[1]
+        return Path(__file__).resolve().parents[1]
     except NameError:
-        projeto_root = Path.cwd()
+        return Path.cwd()
 
-    base_data = projeto_root / 'data'
-    base_original = base_data / 'raw_data' / exp
-    base_processed = base_data / 'processed_data' / 'eda_parquet'
-    temp_dir = base_data / 'tmp_parquet_chunks'
 
-    vib_data_dir = base_original / 'vibrationData'
-    oc_data = base_original / f'{exp}_operatingConditions.csv'
-    temp_data = base_original / f'{exp}_meanTemperatures.csv'
+def preprocess_to_parquet_eda(exp: str) -> None:
+    """Maintain the exploratory 4 kHz Parquet pipeline."""
+    print(f"\n[EDA PIPELINE] Construindo dataset analítico do experimento {exp} (4 kHz)...")
+
+    projeto_root = _project_root()
+    base_data = projeto_root / "data"
+    base_original = base_data / "raw_data" / exp
+    base_processed = base_data / "processed_data" / "eda_parquet"
+    temp_dir = base_data / "tmp_parquet_chunks"
+
+    vib_data_dir = base_original / "vibrationData"
+    oc_data = base_original / f"{exp}_operatingConditions.csv"
+    temp_data = base_original / f"{exp}_meanTemperatures.csv"
 
     base_processed.mkdir(parents=True, exist_ok=True)
     if temp_dir.exists():
         shutil.rmtree(temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    FATOR_CONVERSAO_G = 10.0
-    exp_number = int(exp.replace('B', ''))
-    is_128kHz = exp_number <= 9
+    fator_conversao_g = 10.0
+    exp_number = int(exp.replace("B", ""))
+    is_128khz = exp_number <= 9
     transition_idx = TRANSITION_TIMES.get(exp, 0)
 
-    # 2. Sincronização Relacional (As-Of Join)
     df_oc = pd.read_csv(oc_data)
     df_temp = pd.read_csv(temp_data)
-    df_oc['Time'] = pd.to_datetime(df_oc['Time'])
-    df_temp['Time'] = pd.to_datetime(df_temp['Time'])
+    oc_time = _resolve_column(df_oc, ["Time", "dateTime"])
+    temp_time = _resolve_column(df_temp, ["Time", "dateTime"])
+    df_oc[oc_time] = pd.to_datetime(df_oc[oc_time])
+    df_temp[temp_time] = pd.to_datetime(df_temp[temp_time])
+    df_oc = df_oc.rename(columns={oc_time: "Time"})
+    df_temp = df_temp.rename(columns={temp_time: "Time"})
+    _validate_op_features(df_oc, f"{exp}_operatingConditions.csv")
 
     df_meta = pd.merge_asof(
-        df_oc.sort_values('Time'),
-        df_temp.sort_values('Time'),
-        on='Time',
-        direction='backward'
+        df_oc.sort_values("Time"),
+        df_temp.sort_values("Time"),
+        on="Time",
+        direction="backward",
     )
-    df_meta['metaTime'] = (df_meta['Time'] - df_meta['Time'].min()).dt.total_seconds()
+    df_meta["metaTime"] = (df_meta["Time"] - df_meta["Time"].min()).dt.total_seconds()
+    _validate_op_features(df_meta, "merged metadata")
 
-    # 3. Determinação do Tempo Máximo (Vida Útil)
-    matlab_files = sorted([f for f in vib_data_dir.iterdir() if f.suffix == '.mat'])
+    matlab_files = sorted(
+        [file for file in vib_data_dir.iterdir() if file.suffix == ".mat"],
+        key=_numeric_mat_sort_key,
+    )
     if not matlab_files:
         print(f"[ERRO] Nenhum arquivo .mat localizado em: {vib_data_dir}")
         sys.exit(1)
 
     last_meta_row = df_meta.iloc[-1]
     last_mat_data = sio.loadmat(matlab_files[-1])
-    last_meas_time = last_mat_data['measTime'].flatten()
-    
-    global_max_time_s = last_meta_row['metaTime'] + last_meas_time[-1]
-
+    last_meas_time = last_mat_data["measTime"].flatten()
+    global_max_time_s = float(last_meta_row["metaTime"] + last_meas_time[-1])
     del last_mat_data, last_meas_time
     gc.collect()
 
-    # 4. Processamento Digital em Lotes (Out-of-Core)
     for i, file_path in enumerate(matlab_files):
-        # Extração e validação do índice MXXXX para descarte da fase saudável
-        match = re.search(r'M(\d+)', file_path.stem)
-        file_idx = int(match.group(1)) if match else (i + 1)
-        
+        match = re.search(r"M(\d+)", file_path.stem)
+        file_idx = int(match.group(1)) if match else i + 1
         if file_idx < transition_idx:
             continue
-            
-        mat_data = sio.loadmat(file_path)
-        
-        acc_a = mat_data['accHorizRear_A'].flatten() * FATOR_CONVERSAO_G
-        acc_c = mat_data['accHorizFrontal_C'].flatten() * FATOR_CONVERSAO_G
-        meas_time = mat_data['measTime'].flatten()
 
-        # Decimação Estratégica em Cascata para preservação da banda de transição do filtro FIR (Alvo: 4 kHz)
-        if is_128kHz:
-            # Redução total: Fator 32 (8 * 4)
-            acc_a = sig.decimate(sig.decimate(acc_a, q=8, ftype='fir'), q=4, ftype='fir')
-            acc_c = sig.decimate(sig.decimate(acc_c, q=8, ftype='fir'), q=4, ftype='fir')
+        mat_data = sio.loadmat(file_path)
+        acc_a = mat_data["accHorizRear_A"].flatten() * fator_conversao_g
+        acc_c = mat_data["accHorizFrontal_C"].flatten() * fator_conversao_g
+        meas_time = mat_data["measTime"].flatten()
+
+        if is_128khz:
+            acc_a = sig.decimate(sig.decimate(acc_a, q=8, ftype="fir"), q=4, ftype="fir")
+            acc_c = sig.decimate(sig.decimate(acc_c, q=8, ftype="fir"), q=4, ftype="fir")
             meas_time = meas_time[::32]
         else:
-            # Redução total: Fator 16 (8 * 2)
-            acc_a = sig.decimate(sig.decimate(acc_a, q=8, ftype='fir'), q=2, ftype='fir')
-            acc_c = sig.decimate(sig.decimate(acc_c, q=8, ftype='fir'), q=2, ftype='fir')
+            acc_a = sig.decimate(sig.decimate(acc_a, q=8, ftype="fir"), q=2, ftype="fir")
+            acc_c = sig.decimate(sig.decimate(acc_c, q=8, ftype="fir"), q=2, ftype="fir")
             meas_time = meas_time[::16]
-            
-        # Supressão de componente contínua (DC offset)
-        acc_a = sig.detrend(acc_a, type='constant')
-        acc_c = sig.detrend(acc_c, type='constant')
 
+        acc_a = sig.detrend(acc_a, type="constant")
+        acc_c = sig.detrend(acc_c, type="constant")
+        common_length = min(len(acc_a), len(acc_c), len(meas_time))
+        acc_a = acc_a[:common_length]
+        acc_c = acc_c[:common_length]
+        meas_time = meas_time[:common_length]
         meta_index = min(i, len(df_meta) - 1)
         meta_row = df_meta.iloc[meta_index]
-        
-        absolute_time_array = meta_row['metaTime'] + meas_time
+        absolute_time_array = meta_row["metaTime"] + meas_time
         rul_array = global_max_time_s - absolute_time_array
 
-        # Inserção Tabular Otimizada
         df_chunk = pl.DataFrame({
-            'Rul_s': rul_array,
-            'setDynLoad_N': np.full(len(meas_time), meta_row['setDynLoad / N'], dtype=np.float64),
-            'setStatLoad_N': np.full(len(meas_time), meta_row['setStatLoad / N'], dtype=np.float64),
-            'setSpeed_rpm': np.full(len(meas_time), meta_row['setSpeed / rpm'], dtype=np.float64),
-            'peakDynLoad_N': np.full(len(meas_time), meta_row['peak_dynLoad / N'], dtype=np.float64),
-            'StatLoad_N': np.full(len(meas_time), meta_row['meanAbs_statLoad / N'], dtype=np.float64),
-            'Speed_rpm': np.full(len(meas_time), meta_row['meanAbs_speed / rpm'], dtype=np.float64),
-            'TempT1_C': np.full(len(meas_time), meta_row['Mean Abs. Temp. T1 / °C'], dtype=np.float64),
-            'TempT2_C': np.full(len(meas_time), meta_row['Mean Abs. Temp. T2 / °C'], dtype=np.float64),
-            'RoomTemp_C': np.full(len(meas_time), meta_row['Mean Room Temp. / °C'], dtype=np.float64),
-            'AccelA_g': acc_a,
-            'AccelC_g': acc_c,
+            "Rul_s": rul_array,
+            "setDynLoad_N": np.full(len(meas_time), meta_row["setDynLoad / N"], dtype=np.float64),
+            "setStatLoad_N": np.full(len(meas_time), meta_row["setStatLoad / N"], dtype=np.float64),
+            "setSpeed_rpm": np.full(len(meas_time), meta_row["setSpeed / rpm"], dtype=np.float64),
+            "peakDynLoad_N": np.full(len(meas_time), meta_row["peak_dynLoad / N"], dtype=np.float64),
+            "StatLoad_N": np.full(len(meas_time), meta_row["meanAbs_statLoad / N"], dtype=np.float64),
+            "Speed_rpm": np.full(len(meas_time), meta_row["meanAbs_speed / rpm"], dtype=np.float64),
+            "TempT1_C": np.full(len(meas_time), meta_row["Mean Abs. Temp. T1 / °C"], dtype=np.float64),
+            "TempT2_C": np.full(len(meas_time), meta_row["Mean Abs. Temp. T2 / °C"], dtype=np.float64),
+            "RoomTemp_C": np.full(len(meas_time), meta_row["Mean Room Temp. / °C"], dtype=np.float64),
+            "AccelA_g": acc_a,
+            "AccelC_g": acc_c,
         })
-        
+
         chunk_path = temp_dir / f"chunk_{i:04d}.parquet"
         df_chunk.write_parquet(chunk_path)
-        
         del mat_data, acc_a, acc_c, meas_time, absolute_time_array, rul_array, df_chunk
         gc.collect()
 
-    # 5. Consolidação Unificada
     output_file = base_processed / f"eda_{exp}_4kHz.parquet"
-    # Adicionado try/except para previnir erro caso o experimento estivesse inteiramente limpo antes do tempo de transição
     try:
         lazy_dataset = pl.scan_parquet(temp_dir / "*.parquet")
         lazy_dataset.sink_parquet(output_file)
-        print(f"[SUCESSO] Dataset analítico (EDA) consolidado e armazenado em: {output_file}")
-    except Exception as e:
-        print(f"[AVISO] Nenhum dado gerado para {exp} após o filtro de transição. Detalhes: {e}")
-        
+        print(f"[SUCESSO] Dataset analítico (EDA) consolidado em: {output_file}")
+    except Exception as exc:
+        print(f"[AVISO] Nenhum dado gerado para {exp} após o filtro de transição: {exc}")
     shutil.rmtree(temp_dir, ignore_errors=True)
 
-def preprocess_to_npz(exp: str, window_size: int, seq_length: int, f_amostragem_kHz: int) -> None:
-    """
-    Realiza o pré-processamento dos dados brutos experimentais, aplicando sincronização
-    relacional, decimação dinâmica e estruturação em tensores quadridimensionais
-    para o treinamento sequencial. Alvo de amostragem estabelecido em 32 kHz.
-    
-    A filtragem temporal descarta arquivos correspondentes à fase saudável do componente.
-    
-    Parâmetros:
-    -----------
-    exp : str
-        Identificador alfanumérico do ensaio (ex.: 'B01').
-    window_size : int
-        Número de amostras pontuais (discretas) que compõem cada janela.
-    seq_length : int
-        Número de janelas concatenadas para formar a trajetória de degradação.
-    f_amostragem_kHz : int
-        Frequência alvo para a taxa de amostragem após a decimação digital.
-    """
-    print(f"\n[TENSOR PIPELINE] Iniciando conversão matricial sequencial do experimento {exp} ({f_amostragem_kHz} kHz)...")
-    
-    try:
-        projeto_root = Path(__file__).resolve().parents[1]
-    except NameError:
-        projeto_root = Path.cwd()
 
-    base_data = projeto_root / 'data'
-    base_original = base_data / 'raw_data' / exp
-    base_processed = base_data / 'processed_data'
-    tensors_dir = base_processed / f'{exp}_tensors'
-    
-    vib_data_dir = base_original / 'vibrationData'
-    oc_data = base_original / f'{exp}_operatingConditions.csv'
-    temp_data = base_original / f'{exp}_meanTemperatures.csv'
+def preprocess_to_npz(
+    exp: str,
+    window_size: int = 4096,
+    seq_length: int = 10,
+    f_amostragem_kHz: int = 32,
+) -> None:
+    """Generate schema-v2 out-of-core vibration tensors for one bearing."""
+    print(f"\n[TENSOR PIPELINE] Processando {exp} em {f_amostragem_kHz} kHz...")
+
+    projeto_root = _project_root()
+    base_original = projeto_root / "data" / "raw_data" / exp
+    base_processed = projeto_root / "data" / "processed_data"
+    tensors_dir = base_processed / f"{exp}_tensors"
+    vib_data_dir = base_original / "vibrationData"
+    oc_data = base_original / f"{exp}_operatingConditions.csv"
+    temp_data = base_original / f"{exp}_meanTemperatures.csv"
+
+    if not oc_data.exists() or not temp_data.exists():
+        raise FileNotFoundError(f"Arquivos CSV operacionais ausentes em: {base_original}")
+    if exp not in TRANSITION_TIMES:
+        raise ValueError(f"Experimento sem TRANSITION_TIMES: {exp}")
 
     base_processed.mkdir(parents=True, exist_ok=True)
     if tensors_dir.exists():
         shutil.rmtree(tensors_dir)
     tensors_dir.mkdir(parents=True, exist_ok=True)
 
-    FATOR_CONVERSAO_G = 10.0
-    exp_number = int(exp.replace('B', ''))
-    is_128kHz = exp_number <= 9
-    transition_idx = TRANSITION_TIMES.get(exp, 0)
-
-    if not (oc_data.exists() and temp_data.exists()):
-        print(f"[ERRO] Arquivos de variáveis operacionais (CSV) ausentes em: {base_original}")
-        sys.exit(1)
-        
     df_oc = pd.read_csv(oc_data)
     df_temp = pd.read_csv(temp_data)
-
-    df_oc['Time'] = pd.to_datetime(df_oc['Time'])
-    df_temp['Time'] = pd.to_datetime(df_temp['Time'])
+    oc_time = _resolve_column(df_oc, ["Time", "dateTime"])
+    temp_time = _resolve_column(df_temp, ["Time", "dateTime"])
+    df_oc[oc_time] = pd.to_datetime(df_oc[oc_time])
+    df_temp[temp_time] = pd.to_datetime(df_temp[temp_time])
+    df_oc = df_oc.rename(columns={oc_time: "Time"})
+    df_temp = df_temp.rename(columns={temp_time: "Time"})
+    _validate_op_features(df_oc, f"{exp}_operatingConditions.csv")
 
     df_meta = pd.merge_asof(
-        df_oc.sort_values('Time'),
-        df_temp.sort_values('Time'),
-        on='Time',
-        direction='backward'
+        df_oc.sort_values("Time"),
+        df_temp.sort_values("Time"),
+        on="Time",
+        direction="backward",
     )
-    df_meta['metaTime'] = (df_meta['Time'] - df_meta['Time'].min()).dt.total_seconds()
+    df_meta["metaTime"] = (df_meta["Time"] - df_meta["Time"].min()).dt.total_seconds()
+    _validate_op_features(df_meta, f"{exp} metadata")
 
-    matlab_files = sorted([f for f in vib_data_dir.iterdir() if f.suffix == '.mat'])
+    matlab_files = sorted(
+        [file for file in vib_data_dir.iterdir() if file.suffix == ".mat"],
+        key=_numeric_mat_sort_key,
+    )
     if not matlab_files:
-        print(f"[ERRO] Diretório de dados de vibração vazio: {vib_data_dir}")
-        sys.exit(1)
+        raise FileNotFoundError(f"Diretório de vibração vazio: {vib_data_dir}")
+
+    file_indices = [_numeric_mat_sort_key(file) for file in matlab_files]
+    total_cycles = max(file_indices)
+    tt_idx = TRANSITION_TIMES[exp]
+    if total_cycles <= tt_idx:
+        raise ValueError(
+            f"{exp}: total_cycles={total_cycles} deve ser maior que "
+            f"tt_idx={tt_idx}"
+        )
 
     last_meta_row = df_meta.iloc[-1]
     last_mat_data = sio.loadmat(matlab_files[-1])
-    last_meas_time = last_mat_data['measTime'].flatten()
-    
-    global_max_time_s = last_meta_row['metaTime'] + last_meas_time[-1]
-
+    last_meas_time = last_mat_data["measTime"].flatten()
+    global_max_time_s = float(last_meta_row["metaTime"] + last_meas_time[-1])
     del last_mat_data, last_meas_time
     gc.collect()
 
+    is_128khz = int(exp.replace("B", "")) <= 9
+    fator_q = 128 // f_amostragem_kHz if is_128khz else 64 // f_amostragem_kHz
+    if fator_q < 1:
+        raise ValueError("f_amostragem_kHz excede a resolução de decimação disponível")
+
     total_sequences_generated = 0
-    
     for i, file_path in enumerate(matlab_files):
-        # Exclusão da amostragem anterior ao período de degradação
-        match = re.search(r'M(\d+)', file_path.stem)
-        file_idx = int(match.group(1)) if match else (i + 1)
-        
-        if file_idx < transition_idx:
+        file_idx = _numeric_mat_sort_key(file_path)
+        if file_idx < tt_idx:
             continue
-            
+
         mat_data = sio.loadmat(file_path)
-        
-        acc_a = mat_data['accHorizRear_A'].flatten() * FATOR_CONVERSAO_G
-        acc_c = mat_data['accHorizFrontal_C'].flatten() * FATOR_CONVERSAO_G
-        meas_time = mat_data['measTime'].flatten()
-
-        # Determinação do fator de subamostragem baseado na frequência original
-        # Assegurando taxa final idêntica (ex. 32 kHz) para todos os ensaios
-        fator_q = 128//f_amostragem_kHz if is_128kHz else 64//f_amostragem_kHz
-
-        # Aplicação de decimação e filtro FIR anti-aliasing
-        acc_a = sig.decimate(acc_a, q=fator_q, ftype='fir')
-        acc_c = sig.decimate(acc_c, q=fator_q, ftype='fir')
+        acc_a = mat_data["accHorizRear_A"].flatten() * 10.0
+        acc_c = mat_data["accHorizFrontal_C"].flatten() * 10.0
+        meas_time = mat_data["measTime"].flatten()
+        acc_a = sig.decimate(acc_a, q=fator_q, ftype="fir")
+        acc_c = sig.decimate(acc_c, q=fator_q, ftype="fir")
         meas_time = meas_time[::fator_q]
-        
-        # Centralização da média da forma de onda em zero
-        acc_a = sig.detrend(acc_a, type='constant')
-        acc_c = sig.detrend(acc_c, type='constant')
-            
+        acc_a = sig.detrend(acc_a, type="constant")
+        acc_c = sig.detrend(acc_c, type="constant")
+        common_length = min(len(acc_a), len(acc_c), len(meas_time))
+        acc_a = acc_a[:common_length]
+        acc_c = acc_c[:common_length]
+        meas_time = meas_time[:common_length]
+
         meta_index = min(i, len(df_meta) - 1)
         meta_row = df_meta.iloc[meta_index]
-        
-        absolute_time_array = meta_row['metaTime'] + meas_time
-        rul_array = global_max_time_s - absolute_time_array
-
-        X_matrix = np.column_stack((
-            acc_a,
-            acc_c,
-            np.full(len(meas_time), meta_row['meanAbs_speed / rpm']), 
-            np.full(len(meas_time), meta_row['meanAbs_statLoad / N']) 
+        absolute_time_array = meta_row["metaTime"] + meas_time
+        y_rul_s = global_max_time_s - absolute_time_array
+        y_pct_cycle = float(np.clip(
+            (total_cycles - file_idx) / (total_cycles - tt_idx),
+            0.0,
+            1.0,
         ))
-        
-        num_windows = len(X_matrix) // window_size
+
+        vib_matrix = np.column_stack((acc_a, acc_c))
+        num_windows = len(vib_matrix) // window_size
         if num_windows < seq_length:
+            del mat_data, acc_a, acc_c, meas_time, vib_matrix, absolute_time_array, y_rul_s
+            gc.collect()
             continue
-            
-        X_trunc = X_matrix[:num_windows * window_size, :]
-        rul_trunc = rul_array[:num_windows * window_size]
-        
-        # Segmentação das amostras em blocos bidimensionais (janelas)
-        X_3d = X_trunc.reshape((num_windows, window_size, X_matrix.shape[1]))
-        X_3d = np.transpose(X_3d, (0, 2, 1))
-        
-        rul_2d = rul_trunc.reshape((num_windows, window_size))
-        y_rul = rul_2d[:, -1]
-        
-        # Formação das matrizes sequenciais (Sliding Window para histórico LSTM)
-        X_seq_view = np.lib.stride_tricks.sliding_window_view(X_3d, window_shape=seq_length, axis=0)
-        X_seq = np.transpose(X_seq_view, (0, 3, 1, 2))
-        
-        y_seq = y_rul[seq_length - 1:]
-        
-        chunk_path = tensors_dir / f"tensor_chunk_{i:04d}.npz"
-        np.savez_compressed(
-            chunk_path, 
-            X=X_seq.astype(np.float32), 
-            y=y_seq.astype(np.float32)
+
+        vib_trunc = vib_matrix[:num_windows * window_size, :]
+        rul_trunc = y_rul_s[:num_windows * window_size]
+        X_vib_3d = vib_trunc.reshape((num_windows, window_size, 2))
+        X_vib_3d = np.transpose(X_vib_3d, (0, 2, 1)).astype(np.float32)
+        X_vib_seq_view = np.lib.stride_tricks.sliding_window_view(
+            X_vib_3d,
+            window_shape=seq_length,
+            axis=0,
         )
-        total_sequences_generated += len(X_seq)
-        
-        del mat_data, acc_a, acc_c, meas_time, X_matrix, X_trunc, rul_trunc, X_3d, X_seq_view, X_seq
+        X_vib_seq = np.transpose(X_vib_seq_view, (0, 3, 1, 2)).astype(np.float32)
+
+        rul_2d = rul_trunc.reshape((num_windows, window_size))
+        y_rul_s = rul_2d[:, -1]
+        op_vec = np.array([meta_row[column] for column in OP_FEATURE_COLS], dtype=np.float32)
+        X_op_seq = np.repeat(op_vec[None, :], len(X_vib_seq), axis=0)
+        y_pct_seq = np.full(len(X_vib_seq), y_pct_cycle, dtype=np.float32)
+        y_s_seq = y_rul_s[seq_length - 1:].astype(np.float32)
+        file_idx_seq = np.full(len(X_vib_seq), file_idx, dtype=np.int32)
+
+        if not (
+            np.isfinite(X_vib_seq).all()
+            and np.isfinite(X_op_seq).all()
+            and np.isfinite(y_pct_seq).all()
+            and np.isfinite(y_s_seq).all()
+        ):
+            raise ValueError(TENSOR_FORMAT_ERROR)
+        if np.any((y_pct_seq < 0.0) | (y_pct_seq > 1.0)):
+            raise ValueError(TENSOR_FORMAT_ERROR)
+
+        chunk_path = tensors_dir / f"tensor_chunk_{file_idx:05d}.npz"
+        np.savez_compressed(
+            chunk_path,
+            X_vib=X_vib_seq,
+            X_op=X_op_seq,
+            y_pct=y_pct_seq,
+            y_s=y_s_seq,
+            file_idx=file_idx_seq,
+            op_feature_names=np.asarray(OP_FEATURE_COLS, dtype=np.str_),
+        )
+        total_sequences_generated += len(X_vib_seq)
+        del mat_data, acc_a, acc_c, meas_time, vib_matrix, vib_trunc, rul_trunc
+        del X_vib_3d, X_vib_seq_view, X_vib_seq, rul_2d, y_rul_s
+        del op_vec, X_op_seq, y_pct_seq, y_s_seq, file_idx_seq
         gc.collect()
 
-    print(f"[SUCESSO] Operação estrutural concluída. Quantidade de sequências geradas: {total_sequences_generated}.")
+    print(
+        f"[SUCESSO] Tensores salvos em {tensors_dir}: "
+        f"{total_sequences_generated} sequências."
+    )
 
-def calcular_estatisticas_treino(processed_dir: Path, target_dir: Path, bearings_train: List[str]) -> Path:
-    """
-    Varre os arquivos gerados correspondentes à partição de treinamento estipulada
-    para extração dos parâmetros estatísticos globais. A rotina assegura a invariabilidade
-    das escalas gravando o metadado no diretório isolado da respectiva iteração LORO.
-    """
-    print(f"\n[ESTATÍSTICA] Computando métricas de normalização global sobre a amostragem: {bearings_train}")
-    op_accumulated = []
-    y_max_global = 0.0
+
+def calcular_estatisticas_treino(
+    processed_dir: Path,
+    target_dir: Path,
+    bearings_train: List[str],
+) -> Path:
+    """Calculate global operational z-score statistics with O(1) memory."""
+    total_count = 0
+    sum_x = np.zeros(3, dtype=np.float64)
+    sum_x2 = np.zeros(3, dtype=np.float64)
 
     for exp in bearings_train:
         tensor_path = processed_dir / f"{exp}_tensors"
-        files = sorted(glob.glob(str(tensor_path / "tensor_chunk_*.npz")))
-        
-        for file in files:
-            with np.load(file) as data:
-                X = data["X"]
-                y = data["y"]
-                # Extração isolada dos tensores operacionais
-                op_features = X[:, :, 2:4, 0].reshape(-1, 2)
-                op_accumulated.append(op_features)
-                
-                local_y_max = float(np.max(y))
-                if local_y_max > y_max_global:
-                    y_max_global = local_y_max
+        files = sorted(tensor_path.glob("tensor_chunk_*.npz"), key=_chunk_index)
+        for file_path in files:
+            with np.load(file_path, allow_pickle=False) as data:
+                if "X_op" not in data.files:
+                    raise ValueError(TENSOR_FORMAT_ERROR)
+                X_op = data["X_op"]
+                if X_op.ndim != 2 or X_op.shape[1] != 3:
+                    raise ValueError(TENSOR_FORMAT_ERROR)
+                if not np.isfinite(X_op).all():
+                    raise ValueError(TENSOR_FORMAT_ERROR)
+                total_count += X_op.shape[0]
+                sum_x += X_op.astype(np.float64).sum(axis=0)
+                sum_x2 += np.square(X_op.astype(np.float64)).sum(axis=0)
 
-    if not op_accumulated:
-        raise RuntimeError(f"Falha de leitura. Os tensores não foram localizados para os ensaios: {bearings_train}.")
+    if total_count == 0:
+        raise RuntimeError(
+            f"Falha de leitura: nenhum tensor X_op localizado para {bearings_train}"
+        )
 
-    op_matrix = np.vstack(op_accumulated)
-    op_mean = np.mean(op_matrix, axis=0).tolist()
-    op_std = (np.std(op_matrix, axis=0) + 1e-8).tolist()
-
+    op_mean = sum_x / total_count
+    op_std = np.sqrt(np.maximum(sum_x2 / total_count - op_mean**2, 0.0)) + 1e-8
     metadata = {
-        "op_mean": op_mean,
-        "op_std": op_std,
-        "y_max": y_max_global
+        "schema_version": 2,
+        "target_mode": "rul_pct_post_tt",
+        "op_feature_names": OP_FEATURE_COLS,
+        "num_op_features": 3,
+        "op_mean": op_mean.astype(np.float32).tolist(),
+        "op_std": op_std.astype(np.float32).tolist(),
     }
 
-    # Garante a existência do diretório específico da iteração antes de salvar
     target_dir.mkdir(parents=True, exist_ok=True)
     output_json = target_dir / "metadata_normalization.json"
-    
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=4)
-        
-    print(f"[SUCESSO] Parâmetros estatísticos isolados e salvos em: {output_json}")
+    with output_json.open("w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=4)
     return output_json
 
 
-if __name__ == '__main__':
-    # Ensaios selecionados
-    exp_batch = ['B06', 'B13', 'B15']
-    
-    # # Criação de arquivos Parquet para EDA
-    #for experimento in exp_batch:
-    #     preprocess_to_parquet_eda(experimento)
-        
-    # Criação de sequências de tensores
-    for experimento in exp_batch:
-        preprocess_to_npz(experimento, window_size=4096, seq_length=10, f_amostragem_kHz=32)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Pre-processamento de dados experimentais")
+    parser.add_argument("--split", choices=["clean14", "benchmark17"])
+    parser.add_argument("--exp", type=str)
+    parser.add_argument("--window-size", type=int, default=4096)
+    parser.add_argument("--seq-length", type=int, default=10)
+    parser.add_argument("--sample-rate-khz", type=int, default=32)
+    args = parser.parse_args()
+
+    if args.exp:
+        experiments = [item.strip().upper() for item in args.exp.split(",") if item.strip()]
+    elif args.split == "benchmark17":
+        experiments = BENCHMARK17
+    else:
+        experiments = CLEAN14
+
+    for experiment in experiments:
+        preprocess_to_npz(
+            experiment,
+            window_size=args.window_size,
+            seq_length=args.seq_length,
+            f_amostragem_kHz=args.sample_rate_khz,
+        )
